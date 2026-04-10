@@ -116,6 +116,7 @@ async def get_chart_snapshot(
     Returns:
         PNG image bytes or None if failed
     """
+    page = None
     try:
         context = await get_browser_context()
         page = await context.new_page()
@@ -132,41 +133,56 @@ async def get_chart_snapshot(
         
         logger.info(f"Loading chart: {symbol} ({interval})")
         
-        # Navigate to chart with longer timeout
+        # Navigate to chart
         try:
+            # Try with domcontentloaded first (faster)
             await page.goto(chart_url, wait_until="domcontentloaded", timeout=45000)
-        except:
-            # Fallback: try without waiting for full network idle
-            await page.goto(chart_url, timeout=45000)
+        except Exception as e:
+            # If it's a timeout or something that isn't a hard crash, try one more time with 'load'
+            err_msg = str(e).lower()
+            if "interrupted" in err_msg or "closed" in err_msg:
+                 logger.error(f"Critical navigation error for {symbol}: {e}")
+                 raise # Re-raise to be caught by outer try and close page
+            
+            logger.warning(f"Initial navigation for {symbol} failed/timed out: {e}. Trying fallback...")
+            # Brief pause before retry
+            await asyncio.sleep(2)
+            await page.goto(chart_url, wait_until="load", timeout=45000)
         
         # Wait for chart to load (with fallback)
         try:
+            # The legend item is a good indicator the chart has data
             await page.wait_for_selector('div[data-name="legend-source-item"]', timeout=20000)
-        except:
-            # Alternative selector if the first one doesn't work
+        except Exception as e:
+            logger.debug(f"Legend selector not found for {symbol}, trying container: {e}")
             try:
                 await page.wait_for_selector('.chart-container', timeout=10000)
             except:
-                pass  # Continue anyway
+                logger.warning(f"No known chart selectors found for {symbol}, proceeding to screenshot anyway.")
         
-        # Additional wait for chart rendering
-        await asyncio.sleep(3)
+        # Additional wait for actual candle rendering
+        await asyncio.sleep(5)
         
         # Take screenshot
         screenshot = await page.screenshot(type='png', full_page=False)
-        
-        await page.close()
         logger.info(f"Screenshot captured: {len(screenshot)} bytes")
         
         return screenshot
         
     except Exception as e:
-        logger.error(f"Failed to capture chart: {e}")
+        logger.error(f"Failed to capture chart {symbol}: {e}")
         return None
+    finally:
+        if page:
+            try:
+                await page.close()
+            except:
+                pass
 
 
 async def validate_session() -> bool:
     """Validate if TradingView session is working."""
+    page = None
     try:
         context = await get_browser_context()
         page = await context.new_page()
@@ -177,8 +193,6 @@ async def validate_session() -> bool:
         await asyncio.sleep(1)
         content = await page.content()
         
-        await page.close()
-        
         # If we see login/signin, we're NOT authenticated
         is_authenticated = 'sign in' not in content.lower() or 'user-menu' in content.lower()
         
@@ -187,6 +201,12 @@ async def validate_session() -> bool:
     except Exception as e:
         logger.error(f"Session validation failed: {e}")
         return False
+    finally:
+        if page:
+            try:
+                await page.close()
+            except:
+                pass
 
 
 async def cleanup():
