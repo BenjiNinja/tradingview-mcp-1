@@ -99,6 +99,8 @@ def publish_live_state(
             "notes": "",
         },
         "position_review": state.get("position_review") or {"verdict": "NONE", "reason": ""},
+        "pyramid": state.get("pyramid") or {},
+        "setups": state.get("setups") or [],
         "source": state.get("source", "claude_supervisor"),
         "_published_at": now_iso,
     }
