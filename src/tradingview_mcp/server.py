@@ -6,17 +6,31 @@ Optimized with browser reuse and cookie-based authentication for minimal resourc
 """
 
 import os
+import sys
+import json
 import base64
 import logging
 import asyncio
 from typing import Optional
 from pathlib import Path
 
+# Ensure package imports work when launched as a script (MCP stdio)
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ImageContent
 from mcp.server.stdio import stdio_server
+
+from tradingview_mcp.redis_utils import (
+    publish_live_state,
+    read_live_state,
+    fetch_active_positions,
+    bot_symbol,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -317,34 +331,58 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="publish_bias_state",
-            description="Publish the current market regime and directional bias to the bot via Redis.",
+            description="Publish market regime, bias, structure, and optional position review to Redis "
+                       "(key: claude:live_state:{symbol}). Normalizes bias to LONG_ONLY/SHORT_ONLY/BOTH/NO_TRADE.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Trading symbol (e.g., 'BINANCE:BTCUSDT' or 'BTCUSDT')"
-                    },
-                    "regime": {
-                        "type": "string",
-                        "description": "Market regime: e.g. 'Trending', 'Mean-Reverting', 'Panic'"
-                    },
-                    "recommended_bias": {
-                        "type": "string",
-                        "description": "Directional bias: 'BULLISH', 'BEARISH', 'NEUTRAL', 'LONG_ONLY', 'SHORT_ONLY'"
-                    },
-                    "confidence": {
-                        "type": "number",
-                        "description": "Confidence level (0-100)"
-                    },
-                    "reasoning": {
-                        "type": "string",
-                        "description": "Brief reasoning for the current bias"
-                    }
+                    "symbol": {"type": "string", "description": "TV or bot symbol (e.g. BINANCE:BTCUSDT or BTCUSDT)"},
+                    "regime": {"type": "string", "description": "BULLISH | BEARISH | RANGING (aliases normalized)"},
+                    "recommended_bias": {"type": "string", "description": "LONG_ONLY | SHORT_ONLY | BOTH | NO_TRADE"},
+                    "confidence": {"type": "number", "description": "0.0–1.0 or 0–100 (auto-normalized)"},
+                    "reasoning": {"type": "string", "description": "Brief reasoning"},
+                    "ttl_sec": {"type": "number", "description": "Redis TTL seconds (default 28800)", "default": 28800},
+                    "market_structure": {"type": "object", "description": "Optional {trend, last_bos_direction, ...}"},
+                    "chop_trap": {"type": "object", "description": "Optional {is_choppy, is_trap_session, severity, notes}"},
+                    "position_review": {"type": "object", "description": "Optional {verdict, reason} for open holds"},
                 },
-                "required": ["symbol", "regime", "recommended_bias", "confidence"]
-            }
-        )
+                "required": ["symbol", "regime", "recommended_bias", "confidence"],
+            },
+        ),
+        Tool(
+            name="get_market_structure",
+            description="Return market structure (HH_HL / LH_LL / CHOP) from the latest claude:live_state Redis key.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Trading symbol"},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="detect_chop_or_trap",
+            description="Return chop/trap flags from the latest supervisor state in Redis.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Trading symbol"},
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="get_active_position_review",
+            description="Fetch open live/shadow positions from bot Redis (state:{symbol}:positions) "
+                       "with age, entry, and unrealized PnL%% for supervisor prompts.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Bot symbol (e.g. BTCUSDT)"},
+                },
+                "required": ["symbol"],
+            },
+        ),
     ]
 
 
@@ -460,44 +498,95 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
         return results
 
     elif name == "publish_bias_state":
-        # Remove prefix like "BINANCE:" or "NASDAQ:" for the redis contract
         raw_symbol = arguments.get("symbol", "")
-        symbol = raw_symbol.split(":")[-1] if ":" in raw_symbol else raw_symbol
-        
         regime = arguments.get("regime")
         bias = arguments.get("recommended_bias")
         confidence = arguments.get("confidence")
-        reasoning = arguments.get("reasoning", "")
-        
-        if not symbol or not regime or not bias or confidence is None:
+        if not raw_symbol or not regime or not bias or confidence is None:
             return [TextContent(type="text", text="Error: Missing required fields for publish_bias_state.")]
-            
+
         try:
-            import redis
-            import json
-            import time
-            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-            r = redis.Redis.from_url(redis_url)
-            
-            state = {
-                "regime": regime,
-                "recommended_bias": bias.upper(),
-                "confidence": float(confidence),
-                "reasoning": reasoning,
-                "timestamp": time.time(),
-                "source": "claude_supervisor"
-            }
-            
-            # Write to Redis contract expected by the bot
-            r.set(f"claude:live_state:{symbol}", json.dumps(state))
-            # Also update the staleness tracker
-            r.set("claude:last_updated", str(time.time()))
-            
-            logger.info(f"Published bias state for {symbol}: {bias} ({confidence}%)")
-            return [TextContent(type="text", text=f"Successfully published bias state for {symbol}: {bias}")]
+            ttl = int(arguments.get("ttl_sec", 8 * 3600))
+            sym = publish_live_state(
+                raw_symbol,
+                {
+                    "regime": regime,
+                    "recommended_bias": bias,
+                    "confidence": confidence,
+                    "reasoning": arguments.get("reasoning", ""),
+                    "market_structure": arguments.get("market_structure"),
+                    "chop_trap": arguments.get("chop_trap"),
+                    "position_review": arguments.get("position_review"),
+                },
+                ttl_sec=ttl,
+            )
+            return [TextContent(
+                type="text",
+                text=f"Published claude:live_state:{sym} (TTL={ttl}s)",
+            )]
         except Exception as e:
             logger.error(f"Failed to publish bias state: {e}")
             return [TextContent(type="text", text=f"Failed to publish to Redis: {e}")]
+
+    elif name == "get_market_structure":
+        symbol = arguments.get("symbol", "")
+        if not symbol:
+            return [TextContent(type="text", text="Error: symbol is required.")]
+        try:
+            state = read_live_state(symbol)
+            if not state:
+                return [TextContent(type="text", text=json.dumps({
+                    "symbol": bot_symbol(symbol),
+                    "status": "unavailable",
+                    "market_structure": {"trend": "CHOP"},
+                }))]
+            ms = state.get("market_structure", {"trend": "CHOP"})
+            return [TextContent(type="text", text=json.dumps({
+                "symbol": bot_symbol(symbol),
+                "status": "ok",
+                "market_structure": ms,
+                "_published_at": state.get("_published_at"),
+            }))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error reading market structure: {e}")]
+
+    elif name == "detect_chop_or_trap":
+        symbol = arguments.get("symbol", "")
+        if not symbol:
+            return [TextContent(type="text", text="Error: symbol is required.")]
+        try:
+            state = read_live_state(symbol)
+            if not state:
+                return [TextContent(type="text", text=json.dumps({
+                    "symbol": bot_symbol(symbol),
+                    "status": "unavailable",
+                    "is_choppy": False,
+                    "is_trap_session": False,
+                }))]
+            chop = state.get("chop_trap", {})
+            return [TextContent(type="text", text=json.dumps({
+                "symbol": bot_symbol(symbol),
+                "status": "ok",
+                "is_choppy": bool(chop.get("is_choppy", False)),
+                "is_trap_session": bool(chop.get("is_trap_session", False)),
+                "severity": chop.get("severity", "LOW"),
+                "notes": chop.get("notes", ""),
+                "regime": state.get("regime"),
+                "_published_at": state.get("_published_at"),
+            }))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error detecting chop/trap: {e}")]
+
+    elif name == "get_active_position_review":
+        symbol = arguments.get("symbol", "")
+        if not symbol:
+            return [TextContent(type="text", text="Error: symbol is required.")]
+        try:
+            import json as _json
+            data = fetch_active_positions(symbol)
+            return [TextContent(type="text", text=_json.dumps(data, indent=2))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fetching positions: {e}")]
     
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
