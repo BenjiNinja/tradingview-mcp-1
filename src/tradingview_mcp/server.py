@@ -287,6 +287,63 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="get_multi_timeframe_snapshot",
+            description="Fetch multiple TradingView chart snapshots for a symbol at different timeframes. "
+                        "Returns a list of base64-encoded PNG images. Useful for top-down market structure analysis.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Trading symbol in TradingView format (e.g., 'BINANCE:BTCUSDT')"
+                    },
+                    "intervals": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of intervals to capture (e.g., ['60', '240', 'D'])",
+                        "default": ["60", "240", "D"]
+                    },
+                    "theme": {
+                        "type": "string",
+                        "description": "Chart theme: 'dark' or 'light' (default: dark)",
+                        "default": "dark",
+                        "enum": ["dark", "light"]
+                    }
+                },
+                "required": ["symbol", "intervals"]
+            }
+        ),
+        Tool(
+            name="publish_bias_state",
+            description="Publish the current market regime and directional bias to the bot via Redis.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Trading symbol (e.g., 'BINANCE:BTCUSDT' or 'BTCUSDT')"
+                    },
+                    "regime": {
+                        "type": "string",
+                        "description": "Market regime: e.g. 'Trending', 'Mean-Reverting', 'Panic'"
+                    },
+                    "recommended_bias": {
+                        "type": "string",
+                        "description": "Directional bias: 'BULLISH', 'BEARISH', 'NEUTRAL', 'LONG_ONLY', 'SHORT_ONLY'"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence level (0-100)"
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Brief reasoning for the current bias"
+                    }
+                },
+                "required": ["symbol", "regime", "recommended_bias", "confidence"]
+            }
         )
     ]
 
@@ -379,6 +436,68 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                      f"3. Network or timeout issues\n\n"
                      f"Please check your input and try again."
             )]
+            
+    elif name == "get_multi_timeframe_snapshot":
+        symbol = arguments.get("symbol")
+        intervals = arguments.get("intervals", ["60", "240", "D"])
+        theme = arguments.get("theme", "dark")
+        
+        if not symbol or not intervals:
+            return [TextContent(type="text", text="Error: 'symbol' and 'intervals' parameters are required.")]
+            
+        logger.info(f"Fetching multi-timeframe snapshots for {symbol}: {intervals}")
+        
+        results = []
+        for interval in intervals:
+            image_data = await get_chart_snapshot(symbol, interval, 1200, 600, theme)
+            if image_data:
+                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                results.append(TextContent(type="text", text=f"Snapshot for {symbol} (Interval: {interval})"))
+                results.append(ImageContent(type="image", data=image_base64, mimeType="image/png"))
+            else:
+                results.append(TextContent(type="text", text=f"Failed to capture {interval} snapshot for {symbol}."))
+                
+        return results
+
+    elif name == "publish_bias_state":
+        # Remove prefix like "BINANCE:" or "NASDAQ:" for the redis contract
+        raw_symbol = arguments.get("symbol", "")
+        symbol = raw_symbol.split(":")[-1] if ":" in raw_symbol else raw_symbol
+        
+        regime = arguments.get("regime")
+        bias = arguments.get("recommended_bias")
+        confidence = arguments.get("confidence")
+        reasoning = arguments.get("reasoning", "")
+        
+        if not symbol or not regime or not bias or confidence is None:
+            return [TextContent(type="text", text="Error: Missing required fields for publish_bias_state.")]
+            
+        try:
+            import redis
+            import json
+            import time
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+            r = redis.Redis.from_url(redis_url)
+            
+            state = {
+                "regime": regime,
+                "recommended_bias": bias.upper(),
+                "confidence": float(confidence),
+                "reasoning": reasoning,
+                "timestamp": time.time(),
+                "source": "claude_supervisor"
+            }
+            
+            # Write to Redis contract expected by the bot
+            r.set(f"claude:live_state:{symbol}", json.dumps(state))
+            # Also update the staleness tracker
+            r.set("claude:last_updated", str(time.time()))
+            
+            logger.info(f"Published bias state for {symbol}: {bias} ({confidence}%)")
+            return [TextContent(type="text", text=f"Successfully published bias state for {symbol}: {bias}")]
+        except Exception as e:
+            logger.error(f"Failed to publish bias state: {e}")
+            return [TextContent(type="text", text=f"Failed to publish to Redis: {e}")]
     
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
