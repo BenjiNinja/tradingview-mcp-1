@@ -19,25 +19,54 @@ _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from dotenv import load_dotenv
-from playwright.async_api import async_playwright, Browser, BrowserContext
-from mcp.server import Server
-from mcp.types import Tool, TextContent, ImageContent
-from mcp.server.stdio import stdio_server
+# Wrap setup and imports in a try/except block to capture and write any critical errors
+# directly to the supervisor log file, avoiding silent subprocess crashes.
+try:
+    from dotenv import load_dotenv
+    from playwright.async_api import async_playwright, Browser, BrowserContext
+    from mcp.server import Server
+    from mcp.types import Tool, TextContent, ImageContent
+    from mcp.server.stdio import stdio_server
 
-from tradingview_mcp.redis_utils import (
-    publish_live_state,
-    read_live_state,
-    fetch_active_positions,
-    bot_symbol,
-)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
+    from tradingview_mcp.redis_utils import (
+        publish_live_state,
+        read_live_state,
+        fetch_active_positions,
+        bot_symbol,
+    )
+    
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Load environment variables
+    load_dotenv()
+except Exception as startup_err:
+    import traceback
+    from datetime import datetime
+    sys.stderr.write(f"CRITICAL: Failed to import dependencies or initialize in server.py: {startup_err}\n")
+    traceback.print_exc(file=sys.stderr)
+    try:
+        mcp_dir = Path(__file__).resolve().parent
+        current = mcp_dir
+        data_dir = None
+        for _ in range(5):
+            if (current / "data").exists():
+                data_dir = current / "data"
+                break
+            current = current.parent
+        if not data_dir:
+            data_dir = Path(__file__).resolve().parents[3] / "data"
+        
+        data_dir.mkdir(parents=True, exist_ok=True)
+        log_file = data_dir / "claude_scan.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().isoformat()}] === MCP SERVER IMPORT/STARTUP ERROR ===\n")
+            traceback.print_exc(file=f)
+            f.write("=========================================\n")
+    except Exception as log_err:
+        sys.stderr.write(f"Failed to log to data file: {log_err}\n")
+    sys.exit(1)
 
 # Global browser instance (reused for efficiency)
 _playwright = None
