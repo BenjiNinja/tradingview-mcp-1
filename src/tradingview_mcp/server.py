@@ -59,24 +59,37 @@ async def get_browser_context() -> BrowserContext:
         raise ValueError("TradingView credentials not found in environment")
     
     # Start Playwright
-    if _playwright is None:
-        _playwright = await async_playwright().start()
+    try:
+        if _playwright is None:
+            _playwright = await async_playwright().start()
+    except Exception as e:
+        logger.error(f"FATAL: Playwright start failed: {e}", exc_info=True)
+        sys.stderr.write(f"FATAL: Playwright start failed: {e}\n")
+        sys.stderr.flush()
+        raise
     
     # Launch browser in headless mode (lightweight)
     if _browser is None:
-        _browser = await _playwright.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu'
-            ]
-        )
-        logger.info("Browser launched successfully")
+        try:
+            _browser = await _playwright.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu'
+                ]
+            )
+            logger.info("Browser launched successfully")
+        except Exception as e:
+            logger.error(f"FATAL: Chromium launch failed: {e}", exc_info=True)
+            sys.stderr.write(f"FATAL: Chromium launch failed: {e}\n")
+            sys.stderr.flush()
+            raise
+
     
     # Create context with cookies
     _context = await _browser.new_context(
